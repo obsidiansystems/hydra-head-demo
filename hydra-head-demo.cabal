@@ -1,0 +1,55 @@
+name: hydra-head-demo
+version: 0.1
+cabal-version: >= 1.8
+build-type: Simple
+
+
+executable hydra-head-demo
+  main-is: Main.hs
+  hs-source-dirs: src
+  ghc-options: -Wall -Wredundant-constraints -Wincomplete-uni-patterns -Wincomplete-record-updates -O -threaded -fno-show-valid-hole-fits
+  if impl(ghcjs)
+    buildable: False
+  other-modules: Hydra.ClientInput
+               , Hydra.Devnet
+               , Hydra.ServerOutput
+               , Hydra.Types
+               , Paths
+  build-depends: base
+               , process
+               , async
+               , which
+               -- , monad-logger
+               -- , logging-effect
+               , prettyprinter
+               , string-interpolate
+               , containers
+               , text
+               , witherable
+               -- , io-streams
+               , some
+               , directory
+               , aeson
+               , resource-pool
+               , bytestring
+               , uuid
+               , time
+               , reflex
+               , reflex-dom
+               , mtl
+               , jsaddle
+
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+    GADTs
+    ScopedTypeVariables
+    OverloadedStrings
+    FlexibleContexts
+    QuasiQuotes
+    DeriveGeneric
+    RecursiveDo
+    RankNTypes
+    PartialTypeSignatures
+    TypeFamilies
+    TypeApplications
