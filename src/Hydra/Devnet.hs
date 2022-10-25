@@ -56,6 +56,7 @@ devnetMagic = 42
 
 prepareDevnet :: IO ()
 prepareDevnet = do
+  _ <- readCreateProcess (shell "rm -rf devnet") ""
   output <- readCreateProcess (shell "[ -d devnet ] || ./demo/prepare-devnet.sh") ""
   putStrLn output
 
