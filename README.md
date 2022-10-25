@@ -12,4 +12,5 @@ To run the demo enter a Nix shell and run it with `cabal`:
  $ cabal run
 ```
 
-The demo can then be viewed in Chrome at `http://localhost:3003/`.
+The demo can then be viewed in **Chrome**(*Chrome must be used at this time because of a limitation in JSaddle*) at `http://localhost:3003/`.
+
