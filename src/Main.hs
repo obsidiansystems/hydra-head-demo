@@ -195,7 +195,7 @@ runHydraDemo nodes = do
   liftIO . putStrLn $ "Publishing reference scripts"
   hstxid <- publishReferenceScripts
   handles <- standupDemoHydraNetwork hstxid (fmap fst keysAddresses)
-  liftIO . putStrLn $ [i|"Hydra Network Running for nodes #{Map.keys nodes}|]
+  liftIO . putStrLn $ [i|Hydra Network Running for nodes #{Map.keys nodes}|]
   pure $ Map.merge Map.dropMissing Map.dropMissing (Map.zipWithMatched (\_ addr (handle, nodeInfo) -> (handle, addr, nodeInfo))) (fmap snd keysAddresses) handles
 
 
@@ -220,7 +220,6 @@ main =  liftIO $ do
 makeTx :: () => IORef State -> Text
                   -> Map TxIn TxInInfo -> Lovelace -> Text -> IO Text
 makeTx hydraProcessHandlesRef fromName utxos lovelace toName = do
-  print (fromName, utxos, toName)
   let lovelaceUtxos = mapMaybe (Map.lookup "lovelace" . HT.value) utxos
   actors <- readIORef hydraProcessHandlesRef
   jsonStr <-
@@ -466,7 +465,7 @@ app = do
                         <=< buttonClass "bg-green-400 hover:bg-green-400 active:bg-green-200 text-white font-bold text-xl my-2 px-4 py-2 rounded-md w-32" $ text "Do fanout"
                   elClass "div" "mt-4" $ do
                     elClass "div" "mb-1 font-semibold text-sm" $ text "Hydra Node Log"
-                    elClass "div" "p-2 bg-gray-800 rounded-md drop-shadow" $
+                    elClass "div" "p-2 bg-gray-800 rounded-md drop-shadow break-all" $
                       el "ul" $ do
                       comms <- foldDyn (++) [] $
                         ((:[]) . ("Rcv: " <>) . toStrict . toLazyText . encodeToTextBuilder . toJSON <$> webSocketMessage)
