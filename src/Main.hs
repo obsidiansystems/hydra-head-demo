@@ -42,7 +42,6 @@ import qualified Hydra.Types as HT
 import Data.Maybe (fromJust, fromMaybe)
 import Data.Aeson.Types (parseMaybe)
 import System.IO (IOMode(WriteMode), openFile)
-import Data.IORef (readIORef, writeIORef, IORef, newIORef)
 import Hydra.Types
 import Data.Text (Text)
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Char8
@@ -181,10 +180,7 @@ cardanoNodeCreateProcess =
 
 runHydraDemo :: (MonadIO m)
   => HydraDemo
-  -> m (Map Text ( ProcessHandle
-                   , Address -- Cardano address
-                   , HydraNodeInfo
-                   ))
+  -> m RunningNodes
 runHydraDemo nodes = do
   keysAddresses <- forM nodes $ \(actorSeed, fuelSeed) -> do
     keys@(HydraKeyInfo (KeyPair _ vk) _) <- generateKeys
@@ -196,13 +192,8 @@ runHydraDemo nodes = do
   hstxid <- publishReferenceScripts
   handles <- standupDemoHydraNetwork hstxid (fmap fst keysAddresses)
   liftIO . putStrLn $ [i|Hydra Network Running for nodes #{Map.keys nodes}|]
-  pure $ Map.merge Map.dropMissing Map.dropMissing (Map.zipWithMatched (\_ addr (handle, nodeInfo) -> (handle, addr, nodeInfo))) (fmap snd keysAddresses) handles
+  pure $ Map.merge Map.dropMissing Map.dropMissing (Map.zipWithMatched (\_ addr (handle, nodeInfo) -> RunningNode handle addr nodeInfo)) (fmap snd keysAddresses) handles
 
-
-type State = Map Text ( ProcessHandle
-                             , Address -- Cardano address
-                             , HydraNodeInfo
-                             )
 
 headElement :: forall t m. ( TriggerEvent t m, DomBuilder t m) =>m ()
 headElement = do
@@ -217,49 +208,77 @@ main =  liftIO $ do
    threadDelay $ seconds 3
    mainWidgetWithHead headElement app
 
-makeTx :: () => IORef State -> Text
+makeTx :: () => RunningNodes -> Text
                   -> Map TxIn TxInInfo -> Lovelace -> Text -> IO Text
-makeTx hydraProcessHandlesRef fromName utxos lovelace toName = do
+makeTx actors fromName utxos lovelace toName = do
   let lovelaceUtxos = mapMaybe (Map.lookup "lovelace" . HT.value) utxos
-  actors <- readIORef hydraProcessHandlesRef
   jsonStr <-
     buildSignedHydraTx
-      (_signingKey . _cardanoKeys . _keys . (\(_, _, hn) -> hn) $ actors ! fromName)
-      ((\(_, addr, _) -> addr) $ actors ! fromName)
-      ((\(_, addr, _) -> addr) $ actors ! toName)
+      (_signingKey . _cardanoKeys . _keys . _rnNodeInfo $ actors ! fromName)
+      (_rnAddress $ actors ! fromName)
+      (_rnAddress $ actors ! toName)
       lovelaceUtxos
       lovelace
   let jsonTx :: Aeson.Value = fromMaybe (error "Failed to parse TX") . Aeson.decode . ByteString.Char8.pack $ jsonStr
   pure . fromJust . parseMaybe (withObject "signed tx" (.: "cborHex")) $ jsonTx
 
-startDemo :: MonadIO m => IORef State -> HydraDemo -> m RunningNodes
-startDemo hydraProcessHandlesRef demo = do
-  liftIO (mapM (terminateProcess . (\(hndl, _, _) -> hndl)) =<< readIORef hydraProcessHandlesRef)
-  nodeInfos <- runHydraDemo demo
-  liftIO . writeIORef hydraProcessHandlesRef $ nodeInfos
-  actorList :: RunningNodes <- forM nodeInfos $ \(_, addr, nInfo) -> do
-    pure
-      ( addr,
-        [iii|ws://localhost:#{_apiPort nInfo}|]
-      )
-  pure actorList
+
+-- | Stopped demo desired state.
+stoppedDemo :: HydraDemo
+stoppedDemo = mempty
+
+data HydraNetStatus = HNNotRunning | HNStarting | HNRunning { _hnRunningNodes :: RunningNodes }
+
+-- | Start stop demo. When demo is 'mempty' the demo is stopped. If
+-- status is 'HNStarting' nothing is done.
+manageDemo ::
+  forall t m.
+  ( MonadIO (Performable m),
+    PerformEvent t m,
+    TriggerEvent t m,
+    MonadHold t m,
+    MonadFix m
+  ) =>
+  Event t HydraDemo ->
+  m (Dynamic t HydraNetStatus)
+manageDemo desiredStateE = mdo
+  let startStopDemoE = attachWithMaybe (\status demo ->
+                                          case status of
+                                            HNStarting -> Nothing
+                                            _ -> Just demo)
+                       (current statusDyn)
+                       desiredStateE
+  newRunningE <- performEventAsync . ffor (attach (current statusDyn) startStopDemoE) $ \(status, demo) returnAction -> do
+    case status of
+      HNRunning ns -> liftIO . mapM_ (terminateProcess . _rnProcessHandle) $ ns
+      _ -> pure ()
+    unless (demo == stoppedDemo) $
+      liftIO $ void $ forkIO $ returnAction <=< runHydraDemo $ demo
+  statusDyn <- holdDyn HNNotRunning $ leftmost [ bool HNStarting HNNotRunning . (== stoppedDemo) <$> desiredStateE
+                                               , HNRunning <$> newRunningE
+                                               ]
+  pure statusDyn
+
+
+apiAddress :: HydraNodeInfo -> Text
+apiAddress nInfo = [__i|ws://localhost:#{_apiPort nInfo}|]
 
 -- | Friendly name for a Hydra node.
 type DemoNodeName = Text
 
--- | WebSocket URL
-type ApiUrl = Text
+data RunningNode = RunningNode
+  { _rnProcessHandle :: ProcessHandle
+  , _rnAddress :: Address
+  , _rnNodeInfo :: HydraNodeInfo
+  }
 
-type RunningNodes = Map DemoNodeName ( Address -- Cardano address
-                                     , ApiUrl
-                                     )
+type RunningNodes = Map DemoNodeName RunningNode
 
 type HydraDemo =  Map
                   DemoNodeName
                   ( Lovelace -- Seed for actor
                   , Lovelace -- Seed for fuel
                   )
-
 
 seconds :: Int -> Int
 seconds = (* 1000000)
@@ -352,33 +371,32 @@ startStopDemoControls ::
   ( DomBuilder t m,
     MonadFix m,
     PostBuild t m,
-    MonadHold t m, MonadIO (Performable m), PerformEvent t m) =>
-  IORef State ->
-  m (Event t RunningNodes)
-startStopDemoControls hydraProcessHandlesRef = mdo
-  headRunning <- toggle False headStartedOrStoppedE
-  ((), demoConfig) <- runDynamicWriterT $ dyn_ (bool (tellDyn =<< demoSettings alicebobcarolDemo) blank <$> headRunning)
-  startStopHeadE <- buttonClass ((\running ->
-                                    let color :: Text = bool "green" "red" running
-                                    in [__i|bg-#{color}-500 hover:bg-#{color}-400 active:bg-#{color}-300
-                                           text-white font-bold text-xl m-4 px-4 py-2 rounded-md|]
-                                      :: Text)
-                                  <$> headRunning)
-                    $ dynText (bool "Start head" "Stop head" <$> headRunning)
-  let startStopWithConfE = current demoConfig <@ startStopHeadE
-  headStartedOrStoppedE <- performEvent $
-    -- Start with mempty to stop the demo:
-    (\running conf -> startDemo hydraProcessHandlesRef $ bool conf mempty running)
-    <$> current headRunning
-    <@> startStopWithConfE
-  let headStartingDom conf =
-        if Map.null conf
-        then blank
-        else elClass "div" "text-white text-2xl m-4" $ text "Head starting..."
-  void $ runWithReplace blank $ leftmost [ headStartingDom <$> startStopWithConfE
-                                         , blank <$ headStartedOrStoppedE
-                                         ]
-  pure headStartedOrStoppedE
+    MonadHold t m,
+    MonadIO (Performable m),
+    PerformEvent t m,
+    TriggerEvent t m
+  ) =>
+  m (Dynamic t HydraNetStatus)
+startStopDemoControls = mdo
+  demoStatusDyn <- manageDemo desiredDemoStateE
+  ((), demoConfigDyn) <- runDynamicWriterT $ dyn_ . ffor demoStatusDyn $ \case
+    HNNotRunning -> tellDyn =<< demoSettings alicebobcarolDemo
+    _ -> blank
+  let btnBaseCls = "text-white font-bold text-xl m-4 px-4 py-2 rounded-md" :: Text
+  let btnStartStopCls (color :: Text) =
+        [__i|bg-#{color}-500 hover:bg-#{color}-400 active:bg-#{color}-300 #{btnBaseCls}|]
+  desiredDemoStateE <- switchHold never <=< dyn . ffor demoStatusDyn $ \case
+    HNNotRunning ->
+      fmap (pushAlways (const (sample (current demoConfigDyn)))) $
+        buttonClass (pure $ btnStartStopCls "green") $ text "Start head"
+    HNStarting -> do
+      _ <- elAttr' "button" ("class" =: (btnStartStopCls "gray" <> " cursor-not-allowed")
+                              <> "disabled" =: "true")
+                       $ text "Starting head..."
+      pure never
+    HNRunning _ -> do
+      fmap (stoppedDemo <$) $ buttonClass (pure $ btnStartStopCls "red") $ text "Stop head"
+  pure demoStatusDyn
 
 
 app ::
@@ -390,92 +408,95 @@ app ::
     MonadHold t m, PerformEvent t m, TriggerEvent t m) =>
   m ()
 app = do
- hydraProcessHandlesRef :: IORef State <- liftIO (newIORef mempty)
  elClass "div" "w-screen h-screen bg-gray-900 overflow-y-scroll overflow-x-hidden" $ do
   elClass "div" "p-4 m-4 text-white text-5xl font-bold" $ text "Hydra Proof Of Concept Demo"
   mdo
-    headStartedE <- startStopDemoControls hydraProcessHandlesRef
-    void $ runWithReplace blank $ ffor headStartedE $ \actors -> mdo
-      let actorNames = ffor (Map.toList actors) $ \(name, (_,_)) -> name
-      headState <- holdDyn Idle newState
-      let headStateDom = elClass "div" "text-lg" . text . ("Head State: " <>)
-      unless (null actors) $ elClass "div" "ml-4 mt-8 mr-4 mb-2 w-full font-black text-green-500" $ dyn_ $ ffor headState $ \case
-        Idle -> do
-          headStateDom "Idle"
-          elClass "div" "text-green-700 text-sm" $ text "Waiting for participant to init..."
-        Initializing -> do
-          headStateDom "Initializing"
-          elClass "div" "text-green-700 text-sm" $ text $ "Waiting for commits from: " <> T.intercalate ", " actorNames
-        Open -> headStateDom "Open"
-        Closed _ -> headStateDom "Closed/Contestation period"
-        StateReadyToFanout -> headStateDom "Ready to fanout"
-
-      newState <- elClass "div" "ml-4 mr-4 overflow-hidden rounded-lg hover:drop-shadow-xl transition-all drop-shadow bg-gray-800" $ mdo
-        rec
-          currentTab <- holdDyn (head actorNames) changeTab
-
-          changeTab <- fmap leftmost $ elClass "div" "w-full flex flex-row justify-start" $ for actorNames $ \name -> do
-            let
-              isSelected = (== name) <$> currentTab
-              mkClasses selected =
-                T.intercalate " " [ "leading-none p-4 font-bold text-2xl text-gray-100 flex items-center justify-center"
-                                  , bool "bg-gray-800 text-gray-300 pointer-cursor" "bg-gray-700 text-gray-100" selected
-                                  ]
-            (buttonEl, _) <- elDynClass' "button" (mkClasses <$> isSelected) $ text name
-            pure $ name <$ domEvent Click buttonEl
-        fmap (fmap getFirst . snd) . runEventWriterT $ forM (Map.toList actors) $ \(name, (actorAddress, wsUrl)) -> mdo
-              let wsCfg = (WebSocketConfig @t @ClientInput) action never True []
-              ws <- jsonWebSocket wsUrl wsCfg
-              let isSelected = (== name) <$> currentTab
-              let mkClasses selected =
-                     T.intercalate " " [ "p-2 bg-gray-700 text-white flex flex-col items-left"
-                                       , bool "hidden" "" selected
-                                       ]
-              (_, action) <- elDynClass "div" (mkClasses <$> isSelected) $ runEventWriterT $ runWithReplace (elClass "div" "text-white" $ text "Connecting to node...") . ffor (_webSocket_open ws) $ \() -> do
-                let
-                  webSocketMessage :: Event t (ServerOutput Aeson.Value) =
-                    fromMaybe (error "Parsing message from Hydra node failed") <$> _webSocket_recv ws
-                  processLog = \case
-                    ReadyToCommit {} -> Just Initializing
-                    HeadIsOpen {} -> Just Open
-                    HeadIsClosed _ fanoutTime -> Just (Closed fanoutTime)
-                    ReadyToFanout {} -> Just StateReadyToFanout
-                    HeadIsAborted {} -> Just Idle
-                    HeadIsFinalized {} -> Just Idle
-                    _ -> Nothing
-                let stateChange = fmapMaybe processLog webSocketMessage
-                let
-
-                myVKeyB :: Behavior t (Maybe T.Text) <-
-                   hold Nothing
-                     . fmap Just
-                     . mapMaybe (\case
-                                    Greetings (Party vkey') -> Just vkey'
-                                    _ -> Nothing)
-                     $ webSocketMessage
-                headStateE <- mdo
-                  void $ dyn $ ffor headState $ \case
-                    Idle -> idleScreen name
-                    Initializing -> initializingScreen actorAddress myVKeyB webSocketMessage
-                    Open -> openScreen hydraProcessHandlesRef name actorNames actorAddress webSocketMessage
-                    Closed fanoutTime -> closedScreen fanoutTime
-                    StateReadyToFanout ->
-                      tellAction
-                        . (Fanout <$)
-                        <=< buttonClass "bg-green-400 hover:bg-green-400 active:bg-green-200 text-white font-bold text-xl my-2 px-4 py-2 rounded-md w-32" $ text "Do fanout"
-                  elClass "div" "mt-4" $ do
-                    elClass "div" "mb-1 font-semibold text-sm" $ text "Hydra Node Log"
-                    elClass "div" "p-2 bg-gray-800 rounded-md drop-shadow break-all" $
-                      el "ul" $ do
-                      comms <- foldDyn (++) [] $
-                        ((:[]) . ("Rcv: " <>) . toStrict . toLazyText . encodeToTextBuilder . toJSON <$> webSocketMessage)
-                        <>
-                        fmap (fmap (("Snd: " <>) . toStrict . toLazyText . encodeToTextBuilder . toJSON)) action
-                      dyn_ $ mapM (el "li" . text) <$> comms
-                  pure stateChange
-                lift $ tellEvent (First <$> headStateE)
-              pure ()
-      pure ()
+    headNetStatusDyn <- startStopDemoControls
+    void $ dyn_ . ffor headNetStatusDyn $ \case
+      HNNotRunning -> blank
+      HNStarting -> blank
+      HNRunning actors -> mdo
+        let actorNames = Map.keys actors
+        headState <- holdDyn Idle newState
+        let headStateDom = elClass "div" "text-lg" . text . ("Head State: " <>)
+        unless (null actors) $ elClass "div" "ml-4 mt-8 mr-4 mb-2 w-full font-black text-green-500" $ dyn_ $ ffor headState $ \case
+          Idle -> do
+            headStateDom "Idle"
+            elClass "div" "text-green-700 text-sm" $ text "Waiting for participant to init..."
+          Initializing -> do
+            headStateDom "Initializing"
+            elClass "div" "text-green-700 text-sm" $ text $ "Waiting for commits from: " <> T.intercalate ", " actorNames
+          Open -> headStateDom "Open"
+          Closed _ -> headStateDom "Closed/Contestation period"
+          StateReadyToFanout -> headStateDom "Ready to fanout"
+  
+        newState <- elClass "div" "ml-4 mr-4 overflow-hidden rounded-lg hover:drop-shadow-xl transition-all drop-shadow bg-gray-800" $ mdo
+          rec
+            currentTab <- holdDyn (head actorNames) changeTab
+  
+            changeTab <- fmap leftmost $ elClass "div" "w-full flex flex-row justify-start" $ for actorNames $ \name -> do
+              let
+                isSelected = (== name) <$> currentTab
+                mkClasses selected =
+                  T.intercalate " " [ "leading-none p-4 font-bold text-2xl text-gray-100 flex items-center justify-center"
+                                    , bool "bg-gray-800 text-gray-300 pointer-cursor" "bg-gray-700 text-gray-100" selected
+                                    ]
+              (buttonEl, _) <- elDynClass' "button" (mkClasses <$> isSelected) $ text name
+              pure $ name <$ domEvent Click buttonEl
+          fmap (fmap getFirst . snd) . runEventWriterT $ forM (Map.toList actors) $ \(name, RunningNode { _rnNodeInfo = nInfo, _rnAddress = actorAddress}) -> mdo
+                let wsUrl = apiAddress nInfo
+                let wsCfg = (WebSocketConfig @t @ClientInput) action never True []
+                ws <- jsonWebSocket wsUrl wsCfg
+                let isSelected = (== name) <$> currentTab
+                let mkClasses selected =
+                       T.intercalate " " [ "p-2 bg-gray-700 text-white flex flex-col items-left"
+                                         , bool "hidden" "" selected
+                                         ]
+                (_, action) <- elDynClass "div" (mkClasses <$> isSelected) $ runEventWriterT $ runWithReplace (elClass "div" "text-white" $ text "Connecting to node...") . ffor (_webSocket_open ws) $ \() -> do
+                  let
+                    webSocketMessage :: Event t (ServerOutput Aeson.Value) =
+                      fromMaybe (error "Parsing message from Hydra node failed") <$> _webSocket_recv ws
+                    processLog = \case
+                      ReadyToCommit {} -> Just Initializing
+                      HeadIsOpen {} -> Just Open
+                      HeadIsClosed _ fanoutTime -> Just (Closed fanoutTime)
+                      ReadyToFanout {} -> Just StateReadyToFanout
+                      HeadIsAborted {} -> Just Idle
+                      HeadIsFinalized {} -> Just Idle
+                      _ -> Nothing
+                  let stateChange = fmapMaybe processLog webSocketMessage
+                  let
+  
+                  myVKeyB :: Behavior t (Maybe T.Text) <-
+                     hold Nothing
+                       . fmap Just
+                       . mapMaybe (\case
+                                      Greetings (Party vkey') -> Just vkey'
+                                      _ -> Nothing)
+                       $ webSocketMessage
+                  headStateE <- mdo
+                    void $ dyn $ ffor headState $ \case
+                      Idle -> idleScreen name
+                      Initializing -> initializingScreen actorAddress myVKeyB webSocketMessage
+                      Open -> openScreen actors name webSocketMessage
+                      Closed fanoutTime -> closedScreen fanoutTime
+                      StateReadyToFanout ->
+                        tellAction
+                          . (Fanout <$)
+                          <=< buttonClass "bg-green-400 hover:bg-green-400 active:bg-green-200 text-white font-bold text-xl my-2 px-4 py-2 rounded-md w-32" $ text "Do fanout"
+                    elClass "div" "mt-4" $ do
+                      elClass "div" "mb-1 font-semibold text-sm" $ text "Hydra Node Log"
+                      elClass "div" "p-2 bg-gray-800 rounded-md drop-shadow break-all" $
+                        el "ul" $ do
+                        comms <- foldDyn (++) [] $
+                          ((:[]) . ("Rcv: " <>) . toStrict . toLazyText . encodeToTextBuilder . toJSON <$> webSocketMessage)
+                          <>
+                          fmap (fmap (("Snd: " <>) . toStrict . toLazyText . encodeToTextBuilder . toJSON)) action
+                        dyn_ $ mapM (el "li" . text) <$> comms
+                    pure stateChange
+                  lift $ tellEvent (First <$> headStateE)
+                pure ()
+        pure ()
 
 filterUtxos :: Address -> WholeUTXO -> WholeUTXO
 filterUtxos addr = Map.filter ((== addr) . HT.address)
@@ -501,13 +522,11 @@ initializingScreen ::
   m ()
 initializingScreen actorAddress myVKeyB webSocketMessage = do
   elClass "div" "p-2 flex flex-col" $ do
-    -- TODO: did not use performEvent here
-    newUTXOs <- liftIO $ queryAddressUTXOs actorAddress -- fmapMaybe eitherToMaybe <$> (undefined . (DemoApi_GetActorUTXO actorAddress <$) =<< getPostBuild)
+    -- TODO: did not use performEvent here so this will block the UI until UTXOs are queried
+    newUTXOs <- liftIO $ queryAddressUTXOs actorAddress
     let commitSelection doCommit = do
           (_, currentSet) <-
             runDynamicWriterT $ (tellDyn <=< utxoPicker True) newUTXOs
---              runWithReplace (elClass "div" "p-4 bg-gray-800 rounded mb-2" $ text $ "Getting " <> name <> "'s UTXOs...") $
---                (tellDyn <=< utxoPicker True) <$> newUTXOs
           tellAction $ fmap (Commit . fromMaybe mempty) $ current currentSet <@ doCommit
     let hasCommitted =
           attachWithMaybe
@@ -536,6 +555,7 @@ initializingScreen actorAddress myVKeyB webSocketMessage = do
     pure ()
 
 
+-- TODO: the names are passed in multiple times, the actorAddress can be found in twice as well
 openScreen ::
   ( EventWriter t [ClientInput] m,
     DomBuilder t m,
@@ -543,13 +563,13 @@ openScreen ::
     MonadHold t m,
     PostBuild t m,
     MonadIO (Performable m), PerformEvent t m) =>
-  IORef State ->
+  RunningNodes ->
   Text ->
-  [Text] ->
-  Address ->
   Event t (ServerOutput tx) ->
   m ()
-openScreen hydraProcessHandlesRef name actorNames actorAddress webSocketMessage = do
+openScreen actors name webSocketMessage = do
+  let actorNames = Map.keys actors
+  let actorAddress = _rnAddress (actors ! name)
   -- Get your UTxOs on page load and when we observe a transaction
   tellAction . (GetUTxO <$)
     . ( ( void $
@@ -602,7 +622,7 @@ openScreen hydraProcessHandlesRef name actorNames actorAddress webSocketMessage 
       elClass "div" "flex" $ do
         signedTxE <-
           performEvent . fmap liftIO $
-            makeTx hydraProcessHandlesRef name
+            makeTx actors name
               <$> current currentSet
               -- NOTE/TODO(skylar): This is just to default to the minimum
               <*> current (fromMaybe 1000000 <$> lovelaceDyn)
